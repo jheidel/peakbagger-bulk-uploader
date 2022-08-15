@@ -28,6 +28,7 @@ var (
 	inputDirectory = flag.String("directory", "", "Input directory")
 
 	dryRun = flag.Bool("dry_run", false, "Dry run, don't upload ascents")
+	retry = flag.Bool("retry", false, "Retry historic failures")
 
 	// Maps file extension to gpsbabel input format string
 	extToGPSBabelFormat = map[string]string{
@@ -56,7 +57,7 @@ func ToGPX(inputFile string) (string, error) {
 	}
 
 	log.Infof("Converting %q to %q", inputFile, outputFile)
-	cmd := exec.Command("gpsbabel", "-t", "-i", format, "-f", inputFile, "-x", "simplify,count=3000", "-o", "gpx,garminextensions", "-F", outputFile)
+	cmd := exec.Command("gpsbabel", "-t", "-i", format, "-f", inputFile, "-x", "simplify,count=2900", "-o", "gpx,garminextensions", "-F", outputFile)
 
 	if err := cmd.Run(); err != nil {
 		out, _ := cmd.CombinedOutput()
@@ -73,27 +74,25 @@ type TrackBounds struct {
 }
 
 // Calculates the highest point from the provided GPX file
-func ToTrackBounds(g *gpx.GPX) (*TrackBounds, error) {
+func ToTrackBounds(t gpx.GPXTrack) (*TrackBounds, error) {
 	tb := &TrackBounds{}
 
-	for _, track := range g.Tracks {
-		for _, segment := range track.Segments {
-			for _, p := range segment.Points {
-				point := &gpx.GPXPoint{}
-				*point = p
+	for _, segment := range t.Segments {
+		for _, p := range segment.Points {
+			point := &gpx.GPXPoint{}
+			*point = p
 
-				if tb.Start == nil {
-					tb.Start = point
-				}
-				tb.End = point
+			if tb.Start == nil {
+				tb.Start = point
+			}
+			tb.End = point
 
-				if tb.Highest == nil {
-					tb.Highest = point
-				}
+			if tb.Highest == nil {
+				tb.Highest = point
+			}
 
-				if point.Elevation.NotNull() && point.Elevation.Value() > tb.Highest.Elevation.Value() {
-					tb.Highest = point
-				}
+			if point.Elevation.NotNull() && point.Elevation.Value() > tb.Highest.Elevation.Value() {
+				tb.Highest = point
 			}
 		}
 	}
@@ -113,10 +112,15 @@ func ToTrackBounds(g *gpx.GPX) (*TrackBounds, error) {
 	return tb, nil
 }
 
+type History struct {
+	Error string
+	Added time.Time
+}
+
 type Uploader struct {
 	client *peakbagger.PeakBagger
 
-	FilenameHistory map[string]string
+	FilenameHistory map[string]*History
 }
 
 func NewUploader() (*Uploader, error) {
@@ -130,37 +134,12 @@ func NewUploader() (*Uploader, error) {
 
 	return &Uploader{
 		client:          pb,
-		FilenameHistory: make(map[string]string),
+		FilenameHistory: make(map[string]*History),
 	}, nil
 }
 
-func (u *Uploader) Upload(filename string) error {
-	gf, err := ToGPX(filename)
-	if err != nil {
-		return fmt.Errorf("ToGPX failed %w", err)
-	}
-	defer func() {
-		os.Remove(gf)
-	}()
-
-	b, err := ioutil.ReadFile(gf)
-	if err != nil {
-		return fmt.Errorf("read gpx file %w", err)
-	}
-
-	g, err := gpx.ParseBytes(b)
-	if err != nil {
-		return fmt.Errorf("parse gpx bytes %w", err)
-	}
-
-	// TODO we should just process each track individually!
-
-	if len(g.Tracks) != 1 {
-		return fmt.Errorf("too many tracks")
-	}
-	t := g.Tracks[0]
-
-	tb, err := ToTrackBounds(g)
+func (u *Uploader) UploadTrack(t gpx.GPXTrack) error {
+	tb, err := ToTrackBounds(t)
 	if err != nil {
 		return fmt.Errorf("highest point %w", err)
 	}
@@ -216,7 +195,7 @@ func (u *Uploader) Upload(filename string) error {
 	ascent := peakbagger.Ascent{
 		PeakID:     peak.PeakID,
 		Date:       &tb.Highest.Timestamp,
-		Gpx:        g,
+		Gpx:        &gpx.GPX{Tracks: []gpx.GPXTrack{t}},
 		TripReport: fmt.Sprintf("[i]Uploaded by [a href=\"https://github.com/jheidel/peakbagger-bulk-uploader\"]peakbagger-bulk-uploader[/a] on %s[/i]", time.Now().Format(time.RFC3339Nano)),
 
 		// TODO polish up some of the stats
@@ -242,6 +221,40 @@ func (u *Uploader) Upload(filename string) error {
 	log.Infof("Uploaded new ascent for %q", peak.Name)
 
 	return nil
+
+}
+
+func (u *Uploader) UploadFile(filename string) error {
+	gf, err := ToGPX(filename)
+	if err != nil {
+		return fmt.Errorf("ToGPX failed %w", err)
+	}
+	defer func() {
+		os.Remove(gf)
+	}()
+
+	b, err := ioutil.ReadFile(gf)
+	if err != nil {
+		return fmt.Errorf("read gpx file %w", err)
+	}
+
+	g, err := gpx.ParseBytes(b)
+	if err != nil {
+		return fmt.Errorf("parse gpx bytes %w", err)
+	}
+
+	var errAcc error
+	for _, t := range g.Tracks {
+		if err := u.UploadTrack(t); err != nil {
+			err = fmt.Errorf("%v processing track %q", err, t.Name)
+			if errAcc == nil {
+				errAcc = err
+			} else {
+				errAcc = fmt.Errorf("%v, %v", errAcc, err)
+			}
+		}
+	}
+	return errAcc
 }
 
 const HistoryFilename = "history.json"
@@ -267,7 +280,7 @@ func (u *Uploader) SaveHistory() error {
 
 func (u *Uploader) Run() error {
 	if *inputFile != "" {
-		return u.Upload(*inputFile)
+		return u.UploadFile(*inputFile)
 	}
 
 	files, err := ioutil.ReadDir(*inputDirectory)
@@ -287,16 +300,20 @@ func (u *Uploader) Run() error {
 			// Skip unsupported formats
 			continue
 		}
-		if _, ok := u.FilenameHistory[fi.Name()]; ok {
+		hist, ok := u.FilenameHistory[fi.Name()]
+		if ok && (hist.Error == "" || !*retry) {
 			log.Infof("Skipping already processed file %q", fi.Name())
 			continue
 		}
-		err := u.Upload(path.Join(*inputDirectory, fi.Name()))
+		err := u.UploadFile(path.Join(*inputDirectory, fi.Name()))
 		v := ""
 		if err != nil {
 			v = err.Error()
 		}
-		u.FilenameHistory[fi.Name()] = v
+		u.FilenameHistory[fi.Name()] = &History{
+			Error: v,
+			Added: time.Now(),
+		}
 
 		if err := u.SaveHistory(); err != nil {
 			return err
